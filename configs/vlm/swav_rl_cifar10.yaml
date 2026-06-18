@@ -1,0 +1,42 @@
+seed: 42
+output_dir: artifacts/vlm/swav_rl_cifar10
+
+model:
+  model_id: /home/yaner/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3
+  gradient_checkpointing: true
+  lora_path: null          # 设为已有 LoRA 路径可热启动，null 则从头加 LoRA
+  projection:
+    in_dim: 2048
+    mid_dim: 512
+    out_dim: 256
+
+data:
+  data_dir: /home/yaner/kris/warehouse/DiEC/data/cifar-10-batches-py
+  max_per_class: 50        # 50×10 = 500 张图
+  image_size: 64
+  images_per_batch: 8      # 每步图片数（RL 阶段 G×B 前向，显存敏感）
+  steps_per_epoch: 20      # warmup 每 epoch 步数
+  encode_batch_size: 8     # 评测时编码 batch size
+
+training:
+  k: 10                    # 聚类数
+
+  # ── Phase 1: SwAV warmup ──────────────────────────────────────────
+  warmup_epochs: 3
+  lr: 1.0e-4
+  weight_decay: 0.01
+  grad_accum_steps: 4
+  max_grad_norm: 1.0
+  temperature: 0.1
+  sinkhorn_epsilon: 0.05
+  sinkhorn_iters: 3
+
+  # ── Phase 2: GRPO-RL ──────────────────────────────────────────────
+  rl_iterations: 100       # RL 更新步数
+  rl_lr: 5.0e-5            # RL 阶段更低的 lr，防止过快漂离 warmup 结果
+  group_size: 4            # G：每张图采样几组增广对
+  clip_eps: 0.2            # PPO clip epsilon
+  kl_beta: 0.01            # KL 惩罚系数（锚定参考策略）
+  policy_sigma: 1.0        # 高斯策略标准差（控制 log-ratio 尺度）
+  n_reuse: 2               # 每批轨迹重复更新次数
+  rl_eval_every: 20        # 每隔多少步评测一次
