@@ -1,0 +1,26 @@
+seed: 42
+output_dir: artifacts/vlm/encoder_cifar10
+model:
+  model_id: Qwen/Qwen2.5-VL-3B-Instruct
+  gradient_checkpointing: true
+  projection:
+    in_dim: 2048
+    mid_dim: 512
+    out_dim: 256
+data:
+  datasets:
+    - name: cifar10
+      data_dir: /home/yaner/kris/warehouse/DiEC/data/cifar-10-batches-py
+      image_size: 64
+      train_ratio: 0.9
+  batches_per_epoch: 400
+  val_batches: 50
+  images_per_class: 8
+training:
+  epochs: 10
+  lr: 5.0e-5
+  temperature: 0.1
+  weight_decay: 0.01
+  grad_accum_steps: 4
+  max_grad_norm: 1.0
+  log_every: 20

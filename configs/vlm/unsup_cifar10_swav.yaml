@@ -1,0 +1,31 @@
+seed: 42
+output_dir: artifacts/vlm/unsup_encoder_cifar10_swav
+model:
+  model_id: /home/yaner/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3
+  gradient_checkpointing: true
+  projection:
+    in_dim: 2048
+    mid_dim: 512
+    out_dim: 256
+data:
+  datasets:
+    - name: cifar10
+      data_dir: /home/yaner/kris/warehouse/DiEC/data/cifar-10-batches-py
+      image_size: 64
+      max_per_class: 100    # 100 * 10 = 1000 images (fixed indexed subset)
+  images_per_batch: 32
+  batches_per_epoch: 40     # training steps per epoch
+  encode_batch_size: 16     # batch size for the no-grad monitoring pass
+  image_size: 64
+training:
+  method: swav
+  k: 10                     # prototypes = 10 semantic clusters
+  epochs: 20
+  lr: 1.0e-4
+  weight_decay: 0.01
+  grad_accum_steps: 4
+  max_grad_norm: 1.0
+  temperature: 0.1          # softmax temperature on prototype scores
+  sinkhorn_epsilon: 0.05    # entropy reg for Sinkhorn codes
+  sinkhorn_iters: 3
+  freeze_prototypes_epochs: 0   # prototypes KMeans-init'd, trained from start

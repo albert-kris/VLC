@@ -1,0 +1,12 @@
+output_dir: artifacts/vlm/eval/encoder_cifar100
+eval:
+  dataset: cifar100
+  data_dir: /home/yaner/kris/warehouse/DiEC/data/cifar-100-python
+  k: 4
+  n_test: 200
+  methods: [vlc, clip_kmeans]
+  criteria: [by_kingdom, by_activity, by_environment]
+  vlc_model_id: /home/yaner/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3
+  vlc_lora_dir: artifacts/vlm/encoder_cifar100/best
+  load_in_4bit: true
+  batch_size: 8

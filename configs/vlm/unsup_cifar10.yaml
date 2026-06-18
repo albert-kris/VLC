@@ -1,0 +1,33 @@
+seed: 42
+output_dir: artifacts/vlm/unsup_encoder_cifar10
+model:
+  model_id: /home/yaner/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3
+  gradient_checkpointing: true
+  projection:
+    in_dim: 2048
+    mid_dim: 512
+    out_dim: 256
+data:
+  datasets:
+    - name: cifar10
+      data_dir: /home/yaner/kris/warehouse/DiEC/data/cifar-10-batches-py
+      image_size: 64
+      max_per_class: 100    # 100 * 10 = 1000 images (fixed indexed subset)
+  images_per_batch: 32
+  batches_per_epoch: 40     # training steps per epoch
+  encode_batch_size: 16     # batch size for the no-grad global P refresh
+  image_size: 64
+training:
+  method: dec
+  k: 10                     # semantic clustering into the 10 natural classes
+  epochs: 15                # gradual tuning; P refreshed globally each epoch
+  lr: 1.0e-4                # DiEC reference LR
+  weight_decay: 0.01
+  grad_accum_steps: 4
+  max_grad_norm: 1.0
+  cluster_temperature_factor: 1.0   # softens Student-t q to avoid one-hot saturation
+  # Loss weights (DiEC-style): KL sharpening + KNN graph + balance anti-collapse
+  kl_weight: 1.0
+  graph_weight: 0.2
+  balance_weight: 0.02
+  k_neighbors: 5

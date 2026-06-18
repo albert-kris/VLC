@@ -1,0 +1,11 @@
+# Preview episode synthesis (no training)
+# python -m vlc build-episodes --config configs/vlm/build_episodes_preview.yaml --n 3
+
+dataset_configs:
+  - name: 3dshapes
+    h5_path: data/3dshapes.h5
+    n_images: 32
+    batch_size: 8
+    seed: 42
+    train_ratio: 0.9
+    weight: 1.0

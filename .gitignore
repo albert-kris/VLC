@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+data/
+artifacts/
+logs/
+.codegraph/
+*.pt
+*.npz
+*.npy
+*.safetensors
+*.bin
+*.h5
+*.log
+.DS_Store
+.env

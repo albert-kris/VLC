@@ -1,0 +1,30 @@
+seed: 42
+output_dir: artifacts/vlm/unsup_encoder_cifar10_cc
+model:
+  model_id: /home/yaner/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3
+  gradient_checkpointing: true
+  projection:
+    in_dim: 2048
+    mid_dim: 512
+    out_dim: 256
+data:
+  datasets:
+    - name: cifar10
+      data_dir: /home/yaner/kris/warehouse/DiEC/data/cifar-10-batches-py
+      image_size: 64
+      max_per_class: 300
+  images_per_batch: 16      # CC 需要两份视图，batch 减半避免 OOM
+  batches_per_epoch: 150
+  image_size: 64
+training:
+  method: contrastive
+  k: 2
+  epochs: 10
+  lr: 5.0e-5
+  weight_decay: 0.01
+  grad_accum_steps: 4
+  max_grad_norm: 1.0
+  log_every: 20
+  temperature_instance: 0.5
+  temperature_cluster: 1.0
+  entropy_weight: 5.0
