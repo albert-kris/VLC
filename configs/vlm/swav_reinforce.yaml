@@ -1,0 +1,52 @@
+# 真正的 REINFORCE/PPO 训练（替代失效的 GRPO 相位）
+# 关键点：策略 = softmax(原型分数/T) 的离散采样；梯度走 log π(采样动作)；
+# 奖励 = 两增广视图分到同簇；+ batch 边际熵防塌缩；+ PPO clip / KL-to-init 做信赖域。
+seed: 42
+output_dir: artifacts/vlm/swav_reinforce
+
+model:
+  model_id: /home/yaner/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3
+  gradient_checkpointing: true
+  projection:
+    in_dim: 2048
+    mid_dim: 512
+    out_dim: 256
+
+data:
+  data_dir: /home/yaner/kris/warehouse/DiEC/data/cifar-10-batches-py
+  max_per_class: 50
+  image_size: 64
+  images_per_batch: 16        # 边际熵估计更稳，适当增大 batch
+  encode_batch_size: 8
+
+training:
+  k: 10
+  warmup_epochs: 0
+  init_checkpoint: artifacts/vlm/swav_rl_cifar10/warmup_best   # 从 warmup_best(≈0.71) 起步
+
+  rl_iterations: 300
+  rl_eval_every: 5
+  early_stop_patience: 20
+  max_grad_norm: 1.0
+  weight_decay: 0.01
+
+  # 策略 / 采样
+  temperature: 0.5            # 比旧的 0.1 平缓，给采样足够探索性（评测仍用 argmax）
+  group_size: 8               # 每张图采样 G 组离散分配，组内做相对 baseline
+  reward_mode: hard           # hard: 1[c_a==c_b]；soft: 用对方视图概率，方差更低更稠密
+  normalize_adv: true
+  adv_eps: 1.0e-2             # 用 +eps 代替旧代码的 clamp(1e-6)，避免梯度爆炸
+
+  # PPO / 信赖域
+  ppo_epochs: 4               # 冻结 LoRA 时缓存隐状态，可便宜地多跑几轮
+  ppo_clip: 0.2
+
+  # 反塌缩 / 正则
+  balance_coef: 1.0           # 最大化 batch 边际分布熵（等分先验，防"全塌到一个簇"）
+  ent_coef: 0.01              # 小的逐样本熵奖励，鼓励早期探索
+  kl_coef: 0.1                # 对 warmup 初始策略的 KL 惩罚（仅冻结 LoRA 路径生效）
+
+  # 学习率：冻结 LoRA（rl_lr_enc=0）走"缓存隐状态 + 多轮 PPO"的便宜稳定路径
+  rl_lr_enc: 0
+  rl_lr_proj: 1.0e-5
+  rl_lr_proto: 1.0e-5

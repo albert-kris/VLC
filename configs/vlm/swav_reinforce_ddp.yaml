@@ -1,0 +1,55 @@
+# DDP 双卡版 REINFORCE/PPO 训练配置（已按 diagnose_policy.py 诊断结论修正）
+# 关键修正：策略 scores 做 per-row 标准化(policy_standardize) + 温度 0.3，
+# 让温度成为有效旋钮（实测 agree/rand 从 1.0x 提到 4.16x，H/lnK≈0.42）。
+# 每个 rank 处理 images_per_batch=16 张图 → 有效 batch = 16×2 = 32
+seed: 42
+output_dir: artifacts/vlm/swav_reinforce_ddp_sinkhorn
+
+model:
+  model_id: /home/yaner/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3
+  gradient_checkpointing: true
+  projection:
+    in_dim: 2048
+    mid_dim: 512
+    out_dim: 256
+
+data:
+  data_dir: /home/yaner/kris/warehouse/DiEC/data/cifar-10-batches-py
+  max_per_class: 50
+  image_size: 64
+  images_per_batch: 16        # 每 rank 16 张 → 有效 batch 32
+  encode_batch_size: 8
+
+training:
+  k: 10
+  warmup_epochs: 0
+  init_checkpoint: artifacts/vlm/swav_rl_cifar10/warmup_best
+
+  rl_iterations: 300
+  rl_eval_every: 5
+  early_stop_patience: 20
+  max_grad_norm: 1.0
+  weight_decay: 0.01
+
+  # 策略 / 采样（诊断修正）
+  policy_standardize: true    # scores 做 per-row z-score，温度才有效（不改 argmax→不影响 ACC）
+  temperature: 0.3            # 标准化后 T=0.3：agree/rand≈4.16x，H/lnK≈0.42（信号强且有探索）
+  group_size: 8
+  reward_mode: sinkhorn       # hard→sinkhorn：reward=对面视图的等分码，抗塌缩内建于 reward
+  sinkhorn_epsilon: 0.05      # sinkhorn 温度（与 warmup 一致）
+  sinkhorn_iters: 3
+  normalize_adv: true
+  adv_eps: 1.0e-2
+
+  # PPO / 信赖域
+  ppo_epochs: 4
+  ppo_clip: 0.2
+
+  # 反塌缩 / 正则（sinkhorn reward 已内建等分约束，balance bonus 不再承重）
+  balance_coef: 0.0           # 0.05→0：等分交给 sinkhorn 硬约束，不再用软熵 bonus 打架
+  ent_coef: 0.0               # 标准化后探索已足够，不额外推高熵
+  kl_coef: 0.3                # 强锚定 warmup 防漂走
+
+  rl_lr_enc: 0                # LoRA 冻结：缓存隐状态，跑多轮 PPO，启用 KL-to-init
+  rl_lr_proj: 1.0e-5
+  rl_lr_proto: 1.0e-5

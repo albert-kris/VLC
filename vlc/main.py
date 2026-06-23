@@ -20,6 +20,11 @@ COMMANDS: dict[str, tuple[str, str, str]] = {
         "vlc.model.unsup_trainer",
         "main",
     ),
+    "train-rl": (
+        "SwAV-REINFORCE DDP 训练（Sinkhorn reward + PPO，双卡）",
+        "vlc.train.swav_reinforce_ddp_trainer",
+        "main",
+    ),
     "cluster": (
         "推理：编码图像集 + KMeans → cluster assignments",
         "vlc.embed.cluster",

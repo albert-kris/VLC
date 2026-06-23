@@ -1,16 +1,12 @@
 """SwAV-RL Trainer: two-phase training for last-hidden-state clustering.
 
 Phase 1 — SwAV warmup (direct backprop through LoRA):
-    Two augmented views of each image -> Qwen (add_generation_prompt=True)
-    -> last hidden state -> proj_head -> SwAV swapped-prediction loss.
-    Trains: LoRA + proj_head + SwAV prototypes.
+    同一张图的两个增广 -> 大模型最后隐状态 -> 投射层 -> SwAV loss.
 
-Phase 2 — GRPO-RL fine-tuning:
-    Same two-view setup, but gradient flows via policy gradient (GRPO).
-    Reward = SwAV consistency between two views' representations.
-    Advantage = reward standardized within the group.
-    Policy gradient = PPO-clip style ratio * advantage.
-    KL anchor = keep a frozen reference LoRA, penalize KL divergence.
+Phase 2 — GRPO 强化学习:
+    同一张图的两个增广 -> 大模型最后隐状态 -> 投射层 -> z_a, z_b.
+    奖励 = 两个投射向量是否相同（余弦相似度）.
+    只更新 LoRA + 投射层；SwAV 头仅用于聚类评测.
 
 Usage:
     python -m vlc.train.swav_rl_trainer --config configs/vlm/swav_rl_cifar10.yaml
@@ -19,7 +15,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import pickle
 import random
@@ -166,6 +161,47 @@ class SwavRLTrainer:
         save_encoder_checkpoint(encoder, str(self.out_dir / tag))
         torch.save(swav_head.state_dict(), str(self.out_dir / tag / "swav_head.pt"))
 
+    def _load_checkpoint(self, encoder, swav_head, ckpt_dir: str) -> None:
+        """Load encoder LoRA + proj_head + swav_head from a saved directory."""
+        from peft import PeftModel
+
+        ckpt = Path(ckpt_dir)
+        proj_path = ckpt / "proj_head.pt"
+        lora_path = ckpt / "lora"
+        if proj_path.exists():
+            encoder.proj_head.load_state_dict(
+                torch.load(proj_path, map_location=encoder.device, weights_only=True)
+            )
+        if lora_path.exists():
+            if isinstance(encoder.backbone, PeftModel):
+                encoder.backbone.load_adapter(str(lora_path), adapter_name="default")
+            else:
+                encoder.backbone = PeftModel.from_pretrained(
+                    encoder.backbone, str(lora_path), is_trainable=True,
+                )
+        swav_pt = ckpt / "swav_head.pt"
+        if swav_pt.exists():
+            swav_head.load_state_dict(torch.load(swav_pt, map_location=self.device, weights_only=True))
+        print(f"[checkpoint] Loaded from {ckpt_dir}")
+
+    def _init_prototypes(self, encoder, swav_head, images, instruction, k, encode_bs=8):
+        """KMeans-init SwAV prototypes from current encoder embeddings."""
+        n = len(images)
+        print("[init] KMeans prototype init ...")
+        with torch.no_grad():
+            encoder.backbone.eval()
+            z0_chunks = []
+            for i in range(0, min(n, 200), encode_bs):
+                z0_chunks.append(encoder.encode_batch(instruction, images[i:i + encode_bs]).detach().cpu())
+            z0 = torch.cat(z0_chunks, dim=0).float().numpy()
+        km = KMeans(n_clusters=k, n_init=10, random_state=self.cfg.get("seed", 42))
+        km.fit(z0)
+        centroids = torch.tensor(km.cluster_centers_, dtype=swav_head.prototypes.weight.dtype,
+                                 device=self.device)
+        swav_head.prototypes.weight.data.copy_(F.normalize(centroids, dim=1))
+        encoder.backbone.train()
+        print(f"[init] Prototypes from KMeans on {z0.shape[0]} embeddings.")
+
     # ------------------------------------------------------------------
     # Phase 1: SwAV warmup — direct backprop
     # ------------------------------------------------------------------
@@ -176,7 +212,9 @@ class SwavRLTrainer:
         tcfg = self.cfg["training"]
         dcfg = self.cfg["data"]
         warmup_epochs = tcfg.get("warmup_epochs", 5)
-        lr = float(tcfg.get("lr", 1e-4))
+        lr = float(tcfg.get("lr", 1e-4))  # used for scheduler eta_min scale
+        acc_floor = float(tcfg.get("warmup_acc_floor", 0.60))
+        early_stop_on_drop = tcfg.get("warmup_early_stop_on_drop", True)
         batch_size = dcfg.get("images_per_batch", 16)
         steps_per_epoch = dcfg.get("steps_per_epoch", 20)
         grad_accum = tcfg.get("grad_accum_steps", 4)
@@ -206,16 +244,28 @@ class SwavRLTrainer:
         encoder.backbone.train()
         print(f"[warmup] Prototypes initialised from KMeans on {z0.shape[0]} embeddings.")
 
-        trainable = (
-            [p for p in encoder.backbone.parameters() if p.requires_grad]
-            + list(encoder.proj_head.parameters())
-            + list(swav_head.parameters())
-        )
-        optimizer = AdamW(trainable, lr=lr, weight_decay=float(tcfg.get("weight_decay", 0.01)))
+        freeze_backbone = tcfg.get("warmup_freeze_backbone", False)
+        if freeze_backbone:
+            for p in encoder.backbone.parameters():
+                p.requires_grad_(False)
+            print("[warmup] Backbone FROZEN — only proj_head + prototypes trainable.")
+
+        lr_proj = float(tcfg.get("lr_proj", tcfg.get("lr", 1e-4)))
+        lr_proto = float(tcfg.get("lr_proto", tcfg.get("lr", 1e-4)))
+        param_groups = []
+        if not freeze_backbone:
+            param_groups.append({"params": [p for p in encoder.backbone.parameters() if p.requires_grad],
+                                 "lr": float(tcfg.get("lr_enc", tcfg.get("lr", 1e-5)))})
+        param_groups.append({"params": list(encoder.proj_head.parameters()), "lr": lr_proj})
+        param_groups.append({"params": list(swav_head.parameters()), "lr": lr_proto})
+
+        trainable = [p for g in param_groups for p in g["params"]]
+        optimizer = AdamW(param_groups, weight_decay=float(tcfg.get("weight_decay", 0.01)))
         total_steps = max(warmup_epochs * steps_per_epoch // grad_accum, 1)
         scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=lr / 10)
 
         best_acc = -1.0
+        prev_acc = None
         for epoch in range(warmup_epochs):
             acc, nmi, ari = eval_clustering(encoder, swav_head, images, labels,
                                             instruction, self.device, encode_bs)
@@ -223,6 +273,15 @@ class SwavRLTrainer:
             with open(self.out_dir / "history.jsonl", "a") as f:
                 f.write(json.dumps({"phase": "warmup", "epoch": epoch,
                                     "acc": acc, "nmi": nmi, "ari": ari}) + "\n")
+
+            if epoch > 0 and acc < acc_floor:
+                print(f"[warmup] ACC {acc:.4f} < floor {acc_floor:.2f} — stopping warmup early.")
+                break
+            if early_stop_on_drop and prev_acc is not None and acc < prev_acc:
+                print(f"[warmup] ACC dropped {prev_acc:.4f} -> {acc:.4f} — stopping warmup early.")
+                break
+            prev_acc = acc
+
             if acc > best_acc:
                 best_acc = acc
                 self._save(encoder, swav_head, "warmup_best")
@@ -260,161 +319,120 @@ class SwavRLTrainer:
             scheduler.step()
             optimizer.zero_grad()
 
+        self._save(encoder, swav_head, "warmup_final")
         print(f"[warmup] Done. Best ACC={best_acc:.4f}")
 
     # ------------------------------------------------------------------
-    # Phase 2: GRPO-RL
+    # Phase 2: GRPO — 同图两增广，SwAV 一致性为奖励，只训 LoRA + 投射层
     # ------------------------------------------------------------------
 
-    def _train_grpo(self, encoder, swav_head, images, labels, instruction):
-        """GRPO-style RL fine-tuning.
+    def _swav_consistency(self, encoder, swav_head, instruction, va, vb,
+                          temperature, epsilon, sink_iters, freeze_backbone=False):
+        """最后隐状态 -> 投射层 -> SwAV 原型分配 -> swapped prediction 一致性。
 
-        For each mini-batch of B images, sample G augmented view-pairs per
-        image. Reward = per-sample SwAV swapped-prediction score (higher =
-        two views agree on cluster assignment). Advantage = reward
-        standardised within the G-sample group for each image.
-
-        Policy log-probability is modelled as Gaussian over the hidden state
-        vector, enabling a continuous-action PPO-clip update without discrete
-        token sampling.
-
-        KL penalty anchors the policy to a frozen reference LoRA snapshot
-        taken at the start of RL training.
+        奖励 = 0.5 * (q_b·log p(z_a) + q_a·log p(z_b))，越大表示两个增广
+        被分配到越一致的原型。原型每步归一化后参与训练。
+        返回每个样本的奖励 (B,)。
         """
         from vlc.core.losses import sinkhorn
+        if freeze_backbone:
+            with torch.no_grad():
+                h_a = encoder.encode_hidden_batch(instruction, va)
+                h_b = encoder.encode_hidden_batch(instruction, vb)
+        else:
+            h_a = encoder.encode_hidden_batch(instruction, va)
+            h_b = encoder.encode_hidden_batch(instruction, vb)
+        z_a = encoder.proj_head(h_a)
+        z_b = encoder.proj_head(h_b)
+        swav_head.normalize_prototypes()
+        sa = swav_head(z_a)
+        sb = swav_head(z_b)
+        q_a = sinkhorn(sa, epsilon, sink_iters)              # (B, K)
+        q_b = sinkhorn(sb, epsilon, sink_iters)
+        log_pa = F.log_softmax(sa / temperature, dim=1)
+        log_pb = F.log_softmax(sb / temperature, dim=1)
+        return 0.5 * ((q_b * log_pa).sum(1) + (q_a * log_pb).sum(1))   # (B,)
 
+    def _train_grpo(self, encoder, swav_head, images, labels, instruction):
         tcfg = self.cfg["training"]
         dcfg = self.cfg["data"]
-        rl_iters    = tcfg.get("rl_iterations", 200)
+        rl_iters    = tcfg.get("rl_iterations", 100)
         batch_size  = dcfg.get("images_per_batch", 8)
         G           = tcfg.get("group_size", 4)
         lr          = float(tcfg.get("rl_lr", 5e-5))
-        clip_eps    = float(tcfg.get("clip_eps", 0.2))
-        kl_beta     = float(tcfg.get("kl_beta", 0.01))
-        sigma       = float(tcfg.get("policy_sigma", 1.0))   # std of Gaussian policy
-        n_reuse     = int(tcfg.get("n_reuse", 2))
+        lr_enc      = float(tcfg.get("rl_lr_enc", tcfg.get("lr_enc", lr)))
+        lr_proj     = float(tcfg.get("rl_lr_proj", tcfg.get("lr_proj", lr)))
+        lr_proto    = float(tcfg.get("rl_lr_proto", tcfg.get("lr_proto", lr)))
+        max_grad_norm = float(tcfg.get("max_grad_norm", 1.0))
+        eval_every  = int(tcfg.get("rl_eval_every", 1))
+        encode_bs   = dcfg.get("encode_batch_size", 8)
         temperature = float(tcfg.get("temperature", 0.1))
         epsilon     = float(tcfg.get("sinkhorn_epsilon", 0.05))
         sink_iters  = int(tcfg.get("sinkhorn_iters", 3))
-        max_grad_norm = float(tcfg.get("max_grad_norm", 1.0))
-        eval_every  = int(tcfg.get("rl_eval_every", 20))
-        encode_bs   = dcfg.get("encode_batch_size", 8)
         n = len(images)
         aug = TwoViewAug(dcfg.get("image_size", 64))
         rng = random.Random(self.cfg.get("seed", 42) + 1)
-        sigma2 = sigma ** 2
 
-        # Frozen reference policy
-        ref_encoder = copy.deepcopy(encoder)
-        for p in ref_encoder.backbone.parameters():
-            p.requires_grad_(False)
-        for p in ref_encoder.proj_head.parameters():
-            p.requires_grad_(False)
-        ref_encoder.eval()
-        print(f"[GRPO] Reference policy frozen. sigma={sigma}, G={G}, clip_eps={clip_eps}")
-
-        trainable = (
-            [p for p in encoder.backbone.parameters() if p.requires_grad]
-            + list(encoder.proj_head.parameters())
-            + list(swav_head.parameters())
-        )
-        optimizer = AdamW(trainable, lr=lr, weight_decay=float(tcfg.get("weight_decay", 0.01)))
-        best_acc = -1.0
-
-        for it in tqdm(range(1, rl_iters + 1), desc="GRPO-RL"):
-
-            # ── Rollout: collect hidden states and rewards (no grad) ──────
+        # LoRA lr=0 时彻底冻结 backbone，只训投射层 + SwAV 原型
+        freeze_lora = lr_enc <= 0
+        if freeze_lora:
+            for p in encoder.backbone.parameters():
+                p.requires_grad_(False)
             encoder.backbone.eval()
-            batch_idx  = rng.sample(range(n), min(batch_size, n))
-            batch_imgs = [images[i] for i in batch_idx]
+            print("[GRPO] LoRA 已冻结，只更新投射层 + 原型")
+        for p in swav_head.parameters():
+            p.requires_grad_(True)
+        param_groups = []
+        if not freeze_lora:
+            param_groups.append({"params": [p for p in encoder.backbone.parameters() if p.requires_grad], "lr": lr_enc})
+        param_groups.extend([
+            {"params": list(encoder.proj_head.parameters()), "lr": lr_proj},
+            {"params": list(swav_head.parameters()), "lr": lr_proto},
+        ])
+        trainable = [p for g in param_groups for p in g["params"]]
+        optimizer = AdamW(param_groups, weight_decay=float(tcfg.get("weight_decay", 0.01)))
+        patience   = int(tcfg.get("early_stop_patience", 0))   # 0 = 不早停
+        print(f"[GRPO] 奖励=SwAV 一致性, G={G}, lr_enc={lr_enc} lr_proj={lr_proj} lr_proto={lr_proto}")
+        if patience:
+            print(f"[GRPO] 早停: 连续 {patience} 个评测点 ACC 不涨则停")
 
-            # h_a_traj[g] = (B, H) hidden states for view-a, group g
-            h_a_traj, h_b_traj = [], []
-            h_a_ref,  h_b_ref  = [], []
+        best_acc = -1.0
+        no_improve = 0
+        for it in tqdm(range(1, rl_iters + 1), desc="GRPO-RL"):
+            batch_imgs = [images[i] for i in rng.sample(range(n), min(batch_size, n))]
 
+            # 采样 G 组增广：每组里每张图只增广一次，得到 (view_a, view_b)
+            aug_pairs = []
+            rewards = []
             with torch.no_grad():
-                for g in range(G):
+                encoder.backbone.eval()
+                for _ in range(G):
                     va, vb = zip(*[aug(img) for img in batch_imgs])
-                    h_a = encoder.encode_hidden_batch(instruction, list(va))      # (B, H)
-                    h_b = encoder.encode_hidden_batch(instruction, list(vb))
-                    h_a_traj.append(h_a)
-                    h_b_traj.append(h_b)
-                    # Reference policy hidden states for same views
-                    h_a_traj[-1]  # already stored
-                    r_a = ref_encoder.encode_hidden_batch(instruction, list(va))
-                    r_b = ref_encoder.encode_hidden_batch(instruction, list(vb))
-                    h_a_ref.append(r_a)
-                    h_b_ref.append(r_b)
+                    va, vb = list(va), list(vb)
+                    aug_pairs.append((va, vb))
+                    rewards.append(self._swav_consistency(
+                        encoder, swav_head, instruction, va, vb,
+                        temperature, epsilon, sink_iters, freeze_lora))
 
-            # Compute per-sample SwAV consistency reward for each group
-            rewards = []  # list of (B,) tensors, length G
-            with torch.no_grad():
-                for g in range(G):
-                    z_a = encoder.proj_head(h_a_traj[g])   # (B, out_dim)
-                    z_b = encoder.proj_head(h_b_traj[g])
-                    swav_head.normalize_prototypes()
-                    sa = swav_head(z_a)                     # (B, K)
-                    sb = swav_head(z_b)
-                    q_a = sinkhorn(sa, epsilon, sink_iters)  # (B, K)
-                    q_b = sinkhorn(sb, epsilon, sink_iters)
-                    log_pa = F.log_softmax(sa / temperature, dim=1)
-                    log_pb = F.log_softmax(sb / temperature, dim=1)
-                    # Per-sample reward: mean log-likelihood under swapped codes
-                    r = 0.5 * ((q_b * log_pa).sum(1) + (q_a * log_pb).sum(1))  # (B,)
-                    rewards.append(r)
+            rewards_t = torch.stack(rewards, dim=0)                         # (G, B)
+            mean_r = rewards_t.mean(dim=0, keepdim=True)
+            std_r = rewards_t.std(dim=0, keepdim=True).clamp(min=1e-6)
+            advantages = (rewards_t - mean_r) / std_r                        # (G, B)
 
-            # Group-relative advantage: standardise over G for each sample
-            rewards_t  = torch.stack(rewards, dim=0)          # (G, B)
-            mean_r     = rewards_t.mean(dim=0, keepdim=True)
-            std_r      = rewards_t.std(dim=0, keepdim=True).clamp(min=1e-6)
-            advantages = (rewards_t - mean_r) / std_r          # (G, B)
+            # 策略梯度：同一组增广，用当前策略重新算 SwAV 一致性，加权 advantage
+            if not freeze_lora:
+                encoder.backbone.train()
+            optimizer.zero_grad()
+            loss = torch.zeros(1, device=self.device)
+            for g, (va, vb) in enumerate(aug_pairs):
+                sim = self._swav_consistency(
+                    encoder, swav_head, instruction, va, vb,
+                    temperature, epsilon, sink_iters, freeze_lora)
+                loss = loss - (advantages[g].detach() * sim).mean()
+            (loss / G).backward()
+            nn.utils.clip_grad_norm_(trainable, max_grad_norm)
+            optimizer.step()
 
-            # ── Policy-gradient update (with grad) ───────────────────────
-            encoder.backbone.train()
-            for _ in range(n_reuse):
-                optimizer.zero_grad()
-                total_pg  = torch.zeros(1, device=self.device)
-                total_kl  = torch.zeros(1, device=self.device)
-
-                for g in range(G):
-                    va, vb = zip(*[aug(img) for img in batch_imgs])
-                    # Current-policy hidden states (with grad)
-                    h_a_cur = encoder.encode_hidden_batch(instruction, list(va))   # (B, H)
-                    h_b_cur = encoder.encode_hidden_batch(instruction, list(vb))
-
-                    h_a_old = h_a_traj[g].detach()
-                    h_b_old = h_b_traj[g].detach()
-
-                    # Gaussian log-ratio: log π_cur(h_old) − log π_old(h_old)
-                    # Under Gaussian(μ_cur, σ²I) evaluated at h_old:
-                    #   log π_cur ∝ −||h_old − h_a_cur||² / (2σ²)
-                    # Under Gaussian(μ_old≈h_old, σ²I): log π_old ≈ 0 (self-eval)
-                    # So log ratio ≈ −||h_a_cur − h_a_old||² / (2σ²)
-                    log_ratio_a = -((h_a_cur - h_a_old).pow(2).sum(-1)) / (2 * sigma2)  # (B,)
-                    log_ratio_b = -((h_b_cur - h_b_old).pow(2).sum(-1)) / (2 * sigma2)
-
-                    ratio_a = log_ratio_a.exp()
-                    ratio_b = log_ratio_b.exp()
-                    adv_g   = advantages[g].detach()            # (B,)
-
-                    def ppo_clip(ratio, adv):
-                        clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-                        return -torch.min(ratio * adv, clipped * adv).mean()
-
-                    total_pg = total_pg + 0.5 * (ppo_clip(ratio_a, adv_g) +
-                                                  ppo_clip(ratio_b, adv_g))
-
-                    # KL penalty: squared distance between current and reference hidden states
-                    kl_a = ((h_a_cur - h_a_ref[g].detach()).pow(2).sum(-1)).mean() / (2 * sigma2)
-                    kl_b = ((h_b_cur - h_b_ref[g].detach()).pow(2).sum(-1)).mean() / (2 * sigma2)
-                    total_kl = total_kl + 0.5 * (kl_a + kl_b)
-
-                loss = (total_pg + kl_beta * total_kl) / G
-                loss.backward()
-                nn.utils.clip_grad_norm_(trainable, max_grad_norm)
-                optimizer.step()
-
-            # ── Logging and checkpointing ────────────────────────────────
             if it % eval_every == 0:
                 acc, nmi, ari = eval_clustering(encoder, swav_head, images, labels,
                                                 instruction, self.device, encode_bs)
@@ -427,8 +445,14 @@ class SwavRLTrainer:
                                         "acc": acc, "nmi": nmi, "ari": ari}) + "\n")
                 if acc > best_acc:
                     best_acc = acc
+                    no_improve = 0
                     self._save(encoder, swav_head, "rl_best")
                     print(f"  -> RL best ACC={best_acc:.4f}")
+                else:
+                    no_improve += 1
+                    if patience and no_improve >= patience:
+                        print(f"[GRPO] 早停: {patience} 个评测点无改善，best ACC={best_acc:.4f}")
+                        break
 
         print(f"[GRPO] Done. Best ACC={best_acc:.4f}")
 
@@ -459,9 +483,23 @@ class SwavRLTrainer:
         encoder   = self._build_encoder()
         swav_head = self._build_swav_head(out_dim, k)
 
+        # Optional: load a pre-built checkpoint (e.g. zero-shot warmup_best ACC=0.644)
+        init_ckpt = tcfg.get("init_checkpoint") or self.cfg["model"].get("lora_path")
+        if init_ckpt and Path(init_ckpt).exists():
+            self._load_checkpoint(encoder, swav_head, init_ckpt)
+        elif tcfg.get("warmup_epochs", 0) == 0:
+            # No warmup and no checkpoint — init prototypes from KMeans on fresh encoder
+            self._init_prototypes(encoder, swav_head, images, instruction,
+                                  tcfg["k"], dcfg.get("encode_batch_size", 8))
+
         if tcfg.get("warmup_epochs", 0) > 0:
             print("\n=== Phase 1: SwAV warmup ===")
             self._train_warmup(encoder, swav_head, images, labels, instruction)
+            # Reload best warmup checkpoint before RL (not the degraded final weights)
+            best_path = self.out_dir / "warmup_best"
+            if best_path.exists() and tcfg.get("rl_from_warmup_best", True):
+                self._load_checkpoint(encoder, swav_head, str(best_path))
+                print(f"[trainer] Reloaded warmup_best before RL.")
 
         if tcfg.get("rl_iterations", 0) > 0:
             print("\n=== Phase 2: GRPO-RL ===")

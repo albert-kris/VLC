@@ -39,4 +39,4 @@ training:
   kl_beta: 0.01            # KL 惩罚系数（锚定参考策略）
   policy_sigma: 1.0        # 高斯策略标准差（控制 log-ratio 尺度）
   n_reuse: 2               # 每批轨迹重复更新次数
-  rl_eval_every: 20        # 每隔多少步评测一次
+  rl_eval_every: 1         # 每步都评测
