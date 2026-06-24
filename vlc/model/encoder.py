@@ -160,16 +160,41 @@ class CriterionEncoder(nn.Module):
         gen_ids = [seqs[i, L:].detach() for i in range(seqs.shape[0])]
         return inputs, L, gen_ids
 
+    def _end_token_ids(self) -> set[int]:
+        tok = self.processor.tokenizer
+        return {x for x in [tok.eos_token_id, tok.convert_tokens_to_ids("")] if x is not None}
+
+    def _hidden_before_im_end(
+        self, hs: torch.Tensor, L: int, gen_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """取 im_end/EOS 前一个生成 token 的最后一层 hidden。hs shape (L+T, H)。"""
+        gt = [int(t) for t in gen_ids]
+        eos_ids = self._end_token_ids()
+        j = len(gt) - 1
+        while j >= 0 and gt[j] in eos_ids:
+            j -= 1
+        return hs[L + j] if j >= 0 else hs[-1]
+
+    @torch.no_grad()
+    def encode_chain_hidden_one(
+        self, criterion: str, image: Image.Image, max_new_tokens: int = 24,
+    ) -> torch.Tensor:
+        """generate → forward 全序列 → 返回 im_end 前一 token 的 hidden (H,)。"""
+        inp, L, gen = self.generate_chains(
+            criterion, image, 1, max_new_tokens, do_sample=False)
+        _, h = self.score_chains(inp, L, gen)
+        return h[0]
+
     def score_chains(
         self,
         inputs: dict,
         L: int,
         gen_ids: list[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """带梯度重新 forward「提示词+链」，返回 (sum_logp, final_hidden)。
+        """带梯度重新 forward「提示词+链」，返回 (sum_logp, chain_hidden)。
 
-          sum_logp     —— (G,) 每条链生成 token 的 log p 之和（可导，训 LoRA）
-          final_hidden —— (G, hidden) 每条链末态最后一层隐状态（可导，给聚类用）
+          sum_logp      —— (G,) 每条链生成 token 的 log p 之和（可导，训 LoRA）
+          chain_hidden  —— (G, hidden) im_end 前一 token 的最后一层 hidden（给聚类用）
 
         因果 mask 保证位置 i 的 logits 只依赖前缀，故一次整段 forward 即可还原
         每个生成位置当时的条件概率（teacher forcing）。
@@ -202,7 +227,8 @@ class CriterionEncoder(nn.Module):
             logp = F.log_softmax(pred_logits.float(), dim=-1)
             token_logp = logp.gather(1, g.view(-1, 1)).squeeze(1)     # (T,)
             logps.append(token_logp.sum())
-            hiddens.append(out.hidden_states[-1][0, -1, :].float())
+            hs = out.hidden_states[-1][0].float()
+            hiddens.append(self._hidden_before_im_end(hs, L, g))
         return torch.stack(logps), torch.stack(hiddens)
 
     def forward(self, criterion: str, images: list[Image.Image]) -> torch.Tensor:

@@ -20,21 +20,11 @@ data:
 training:
   k: 10
 
-  # Warmup：冻结 backbone，只训投射头 + 原型，给 chain RL 一个像样的原型初值
-  warmup_epochs: 3
-  warmup_freeze_backbone: true
-  lr: 1.0e-4
-  lr_proj: 3.0e-4
-  lr_proto: 3.0e-4
+  # chain 模式不走 warmup；原型由 chain hidden KMeans 初始化
+  warmup_epochs: 0
+
   weight_decay: 0.01
-  grad_accum_steps: 2
   max_grad_norm: 1.0
-  warmup_temperature: 0.1
-  sinkhorn_epsilon: 0.05
-  sinkhorn_iters: 3
-  rl_from_warmup_best: true
-  warmup_acc_floor: 0.0
-  warmup_early_stop_on_drop: false
 
   # ---- DeepSeek 式 GRPO：动作=生成的推理链 token + 采样的簇 ----
   rl_mode: chain

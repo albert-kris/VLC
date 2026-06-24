@@ -225,6 +225,25 @@ class Trainer:
                 ckpt / "swav_head.pt", map_location=self.device, weights_only=True))
         print(f"[checkpoint] Loaded from {ckpt_dir}")
 
+    def _kmeans_init_prototypes_chain(self, encoder, swav_head, images, instruction, k, max_new_tokens):
+        """chain 模式：generate 后取 im_end 前一 token hidden → proj → KMeans 初始化原型。"""
+        with torch.no_grad():
+            encoder.backbone.eval()
+            zs = []
+            n = min(len(images), 200)
+            for i in range(n):
+                h = encoder.encode_chain_hidden_one(instruction, images[i], max_new_tokens)
+                zs.append(encoder.proj_head(h.unsqueeze(0)).detach().cpu())
+                if (i + 1) % 50 == 0:
+                    print(f"[init] chain hidden {i + 1}/{n}", flush=True)
+            z0 = torch.cat(zs, dim=0).float().numpy()
+        km = KMeans(n_clusters=k, n_init=10, random_state=self.cfg.get("seed", 42)).fit(z0)
+        centroids = torch.tensor(km.cluster_centers_, dtype=swav_head.prototypes.weight.dtype,
+                                 device=self.device)
+        swav_head.prototypes.weight.data.copy_(F.normalize(centroids, dim=1))
+        encoder.backbone.train()
+        print(f"[init] Prototypes from chain-hidden KMeans on {z0.shape[0]} embeddings.")
+
     def _kmeans_init_prototypes(self, encoder, swav_head, images, instruction, k, encode_bs):
         """用当前编码器的前若干张图嵌入做 KMeans，初始化 SwAV 原型。"""
         with torch.no_grad():
@@ -654,7 +673,8 @@ class Trainer:
 
         show_eval = len(self.eval_images) > 200
         best_acc, no_improve = -1.0, 0
-        for it in tqdm(range(1, rl_iters + 1), desc="GRPO-chain"):
+        pbar = tqdm(range(1, rl_iters + 1), desc="GRPO-chain")
+        for it in pbar:
             idx = rng.sample(range(n), min(batch_size, n))
             optimizer.zero_grad()
             batch_reward, batch_pg, batch_marg, n_img = 0.0, 0.0, 0.0, 0
@@ -725,22 +745,24 @@ class Trainer:
                 acc, nmi, ari = self._eval_clustering_chain(
                     encoder, swav_head, self.eval_images, self.eval_labels,
                     instruction, max_new_tokens, show_progress=show_eval)
-                print(f"[GRPO-chain it={it:4d}] reward={reward_mean:.4f} "
-                      f"|pg|={batch_pg / max(n_img, 1):.4f} "
-                      f"H(marg)={batch_marg / max(n_img, 1):.3f} "
-                      f"ACC={acc:.4f} NMI={nmi:.4f} ARI={ari:.4f}")
+                msg = (f"[GRPO-chain it={it:4d}] reward={reward_mean:.4f} "
+                       f"|pg|={batch_pg / max(n_img, 1):.4f} "
+                       f"H(marg)={batch_marg / max(n_img, 1):.3f} "
+                       f"ACC={acc:.4f} NMI={nmi:.4f} ARI={ari:.4f}")
+                pbar.write(msg)
+                pbar.set_postfix(acc=f"{acc:.4f}", reward=f"{reward_mean:.3f}", refresh=False)
                 self._log({"phase": "grpo_chain", "iter": it, "reward": reward_mean,
                            "acc": acc, "nmi": nmi, "ari": ari,
                            "marg_entropy": batch_marg / max(n_img, 1)})
                 if acc > best_acc:
                     best_acc, no_improve = acc, 0
                     self._save(encoder, swav_head, "rl_best")
-                    print(f"  -> GRPO-chain best ACC={best_acc:.4f}")
+                    pbar.write(f"  -> GRPO-chain best ACC={best_acc:.4f}")
                 else:
                     no_improve += 1
                     if patience and no_improve >= patience:
-                        print(f"[GRPO-chain] early stop: {patience} pts w/o improvement, "
-                              f"best ACC={best_acc:.4f}")
+                        pbar.write(f"[GRPO-chain] early stop: {patience} pts w/o improvement, "
+                                   f"best ACC={best_acc:.4f}")
                         break
 
         print(f"[GRPO-chain] Done. Best ACC={best_acc:.4f}")
@@ -771,13 +793,19 @@ class Trainer:
         swav_head = self._build_swav_head(out_dim, k)
 
         init_ckpt = tcfg.get("init_checkpoint") or self.cfg["model"].get("lora_path")
+        rl_mode = str(tcfg.get("rl_mode", "cluster")).lower()
+        max_new_tokens = int(tcfg.get("max_new_tokens", 24))
+
         if init_ckpt and Path(init_ckpt).exists():
             self._load_checkpoint(encoder, swav_head, init_ckpt)
+        elif rl_mode == "chain":
+            self._kmeans_init_prototypes_chain(
+                encoder, swav_head, images, INSTRUCTION, k, max_new_tokens)
         elif tcfg.get("warmup_epochs", 0) == 0:
             self._kmeans_init_prototypes(encoder, swav_head, images, INSTRUCTION,
                                          k, dcfg.get("encode_batch_size", 8))
 
-        if tcfg.get("warmup_epochs", 0) > 0:
+        if rl_mode != "chain" and tcfg.get("warmup_epochs", 0) > 0:
             print("\n=== Phase 1: SwAV warmup ===")
             self._train_warmup(encoder, swav_head, images, INSTRUCTION)
             best_path = self.out_dir / "warmup_best"
@@ -785,7 +813,6 @@ class Trainer:
                 self._load_checkpoint(encoder, swav_head, str(best_path))
                 print("[trainer] Reloaded warmup_best before RL.")
 
-        rl_mode = str(tcfg.get("rl_mode", "cluster")).lower()
         if tcfg.get("rl_iterations", 0) > 0:
             if rl_mode == "chain":
                 print("\n=== Phase 2: GRPO-chain (DeepSeek 式生成链) ===")
