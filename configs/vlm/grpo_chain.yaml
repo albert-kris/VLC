@@ -1,0 +1,59 @@
+seed: 42
+output_dir: artifacts/vlm/grpo_chain
+
+model:
+  model_id: /home/yaner/.cache/huggingface/hub/models--Qwen--Qwen2.5-VL-3B-Instruct/snapshots/66285546d2b821cf421d4f5eb2576359d3770cd3
+  gradient_checkpointing: true
+  projection:
+    in_dim: 2048
+    mid_dim: 512
+    out_dim: 256
+
+data:
+  data_dir: /home/yaner/kris/warehouse/DiEC/data/cifar-10-batches-py
+  max_per_class: 50          # 50×10 = 500 张
+  eval_max_per_class: 20     # chain 评测要逐图生成，子集小一点更快
+  image_size: 64
+  images_per_batch: 4        # chain 每图要 2×G 次带梯度 forward，batch 不宜大
+  encode_batch_size: 8
+
+training:
+  k: 10
+
+  # Warmup：冻结 backbone，只训投射头 + 原型，给 chain RL 一个像样的原型初值
+  warmup_epochs: 3
+  warmup_freeze_backbone: true
+  lr: 1.0e-4
+  lr_proj: 3.0e-4
+  lr_proto: 3.0e-4
+  weight_decay: 0.01
+  grad_accum_steps: 2
+  max_grad_norm: 1.0
+  warmup_temperature: 0.1
+  sinkhorn_epsilon: 0.05
+  sinkhorn_iters: 3
+  rl_from_warmup_best: true
+  warmup_acc_floor: 0.0
+  warmup_early_stop_on_drop: false
+
+  # ---- DeepSeek 式 GRPO：动作=生成的推理链 token + 采样的簇 ----
+  rl_mode: chain
+  rl_iterations: 200
+  rl_eval_every: 10
+  early_stop_patience: 20
+
+  group_size: 4              # 每视图采样的推理链条数 G
+  max_new_tokens: 24         # 推理链最大长度
+  gen_temperature: 1.0       # 生成采样温度
+  temperature: 0.3           # 簇策略 softmax 温度
+  policy_standardize: true
+  reward_mode: hard          # hard=两视图配对链同簇；soft=对面视图簇概率
+  normalize_adv: true
+  adv_eps: 1.0e-2
+
+  balance_coef: 1.0          # 组内边际熵，防塌缩
+  ent_coef: 0.0
+
+  rl_lr_enc: 1.0e-5          # chain 模式必须 >0，LoRA 是生成策略本体
+  rl_lr_proj: 3.0e-5
+  rl_lr_proto: 3.0e-5

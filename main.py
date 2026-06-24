@@ -1,9 +1,5 @@
 """SwAV-REINFORCE 单卡整合训练入口。
 
-把 `vlc.train.swav_reinforce_trainer` 的两阶段流程整合到一个文件里，方便论文
-协作阅读。只把"大模型定义"留作外部 import（`vlc.model.*`），其余数据、增广、
-损失、评测、训练循环全部内联于此。
-
 两阶段
 ------
 Phase 1  SwAV warmup —— 同图两增广 → Qwen 最后隐状态 → 投射层 → SwAV 交换预测
@@ -584,6 +580,171 @@ class Trainer:
 
         print(f"[REINFORCE] Done. Best ACC={best_acc:.4f}")
 
+    # ---- Phase 2 (chain): DeepSeek 式 GRPO ----------------------------------
+
+    @torch.no_grad()
+    def _eval_clustering_chain(self, encoder, swav_head, images, labels, instruction,
+                               max_new_tokens, show_progress=False):
+        """评测口径与 chain 训练一致：贪心生成链 → 末态 hidden → 原型 argmax。"""
+        encoder.backbone.eval()
+        swav_head.normalize_prototypes()
+        it = images
+        if show_progress and len(images) > 200:
+            it = tqdm(images, desc=f"eval-chain {len(images)}", leave=False)
+        pred = []
+        for img in it:
+            inp, L, gen = encoder.generate_chains(
+                instruction, img, 1, max_new_tokens, do_sample=False)
+            _, h = encoder.score_chains(inp, L, gen)          # (1, hidden)
+            z = encoder.proj_head(h)
+            pred.append(int(swav_head(z).argmax(1).item()))
+        encoder.backbone.train()
+        pred = np.array(pred)
+        return (cluster_acc(labels, pred),
+                normalized_mutual_info_score(labels, pred),
+                adjusted_rand_score(labels, pred))
+
+    def _train_reinforce_chain(self, encoder, swav_head, images, instruction):
+        """DeepSeek 式：动作=生成的推理链 token（训 LoRA）+ 从链末态采样的簇
+        （训 proj_head + 原型）；reward=两视图配对链的簇一致性；两个 log p 共享
+        同一组内归一化优势做联合 REINFORCE。全程 reward 驱动，无额外可导 loss。"""
+        tcfg, dcfg = self.cfg["training"], self.cfg["data"]
+        rl_iters = int(tcfg.get("rl_iterations", 300))
+        batch_size = int(dcfg.get("images_per_batch", 4))
+        G = int(tcfg.get("group_size", 4))
+        temperature = float(tcfg.get("temperature", 0.5))            # 簇策略温度
+        gen_temperature = float(tcfg.get("gen_temperature", 1.0))    # 生成采样温度
+        max_new_tokens = int(tcfg.get("max_new_tokens", 20))
+        eval_every = int(tcfg.get("rl_eval_every", 5))
+        max_grad_norm = float(tcfg.get("max_grad_norm", 1.0))
+        patience = int(tcfg.get("early_stop_patience", 0))
+        reward_mode = str(tcfg.get("reward_mode", "hard")).lower()
+        normalize_adv = bool(tcfg.get("normalize_adv", True))
+        adv_eps = float(tcfg.get("adv_eps", 1e-2))
+        ent_coef = float(tcfg.get("ent_coef", 0.01))
+        balance_coef = float(tcfg.get("balance_coef", 1.0))
+
+        lr_enc = float(tcfg.get("rl_lr_enc", tcfg.get("lr_enc", 1e-5)))
+        lr_proj = float(tcfg.get("rl_lr_proj", tcfg.get("lr_proj", 1e-5)))
+        lr_proto = float(tcfg.get("rl_lr_proto", tcfg.get("lr_proto", 1e-5)))
+
+        n = len(images)
+        aug = TwoViewAug(dcfg.get("image_size", 64))
+        rng = random.Random(self.cfg.get("seed", 42) + 11)
+
+        # 生成链是策略本体，LoRA 必须可训练并处于 train 模式
+        encoder.backbone.train()
+        for p in swav_head.parameters():
+            p.requires_grad_(True)
+
+        param_groups = [
+            {"params": [p for p in encoder.backbone.parameters() if p.requires_grad],
+             "lr": lr_enc},
+            {"params": list(encoder.proj_head.parameters()), "lr": lr_proj},
+            {"params": list(swav_head.parameters()), "lr": lr_proto},
+        ]
+        trainable = [p for g in param_groups for p in g["params"]]
+        optimizer = AdamW(param_groups, weight_decay=float(tcfg.get("weight_decay", 0.01)))
+
+        print(f"[GRPO-chain] G={G}, gen_T={gen_temperature}, max_new={max_new_tokens}, "
+              f"clus_T={temperature}, reward={reward_mode}, ent={ent_coef}, "
+              f"balance={balance_coef}")
+        if patience:
+            print(f"[GRPO-chain] early stop: {patience} eval points w/o ACC improvement")
+
+        show_eval = len(self.eval_images) > 200
+        best_acc, no_improve = -1.0, 0
+        for it in tqdm(range(1, rl_iters + 1), desc="GRPO-chain"):
+            idx = rng.sample(range(n), min(batch_size, n))
+            optimizer.zero_grad()
+            batch_reward, batch_pg, batch_marg, n_img = 0.0, 0.0, 0.0, 0
+            for im in idx:
+                ia, ib = aug(images[im])
+                swav_head.normalize_prototypes()
+
+                # --- rollout：两视图各采 G 条推理链（no_grad）---
+                inp_a, La, gen_a = encoder.generate_chains(
+                    instruction, ia, G, max_new_tokens, gen_temperature)
+                inp_b, Lb, gen_b = encoder.generate_chains(
+                    instruction, ib, G, max_new_tokens, gen_temperature)
+
+                # --- 带梯度重打分：token logp（训 LoRA）+ 末态 hidden ---
+                logp_chain_a, h_a = encoder.score_chains(inp_a, La, gen_a)   # (G,),(G,hid)
+                logp_chain_b, h_b = encoder.score_chains(inp_b, Lb, gen_b)
+
+                # --- 簇策略：末态 hidden → proj → swav → softmax ---
+                logits_a = self._logits_from_hidden(encoder, swav_head, h_a, temperature)
+                logits_b = self._logits_from_hidden(encoder, swav_head, h_b, temperature)
+                logp_a_all = F.log_softmax(logits_a, dim=1)
+                logp_b_all = F.log_softmax(logits_b, dim=1)
+                pa, pb = logp_a_all.exp(), logp_b_all.exp()
+
+                # --- 采样簇动作 + reward + 组内优势（no_grad）---
+                with torch.no_grad():
+                    ca = Categorical(probs=pa.detach()).sample()    # (G,)
+                    cb = Categorical(probs=pb.detach()).sample()
+                    if reward_mode == "soft":
+                        reward = 0.5 * (
+                            pb.detach().gather(1, ca.view(-1, 1)).squeeze(1)
+                            + pa.detach().gather(1, cb.view(-1, 1)).squeeze(1))
+                    else:  # hard：两视图配对链是否落到同一簇
+                        reward = (ca == cb).float()
+                    mean_r = reward.mean()
+                    if normalize_adv:
+                        adv = (reward - mean_r) / (reward.std() + adv_eps)
+                    else:
+                        adv = reward - mean_r
+                    adv = adv.detach()
+
+                # 簇动作 log p（可导，训 proj + 原型）
+                logp_clus = (logp_a_all.gather(1, ca.view(-1, 1)).squeeze(1)
+                             + logp_b_all.gather(1, cb.view(-1, 1)).squeeze(1))
+                # 链 token log p（可导，训 LoRA）
+                logp_chain = logp_chain_a + logp_chain_b
+                pg = -(adv * (logp_chain + logp_clus)).mean()
+
+                # 抗塌缩：组内边际熵 + 采样熵
+                p_bar = 0.5 * (pa.mean(0) + pb.mean(0))
+                marg_entropy = -(p_bar * p_bar.clamp_min(1e-8).log()).sum()
+                samp_entropy = -0.5 * (
+                    (pa * pa.clamp_min(1e-8).log()).sum(1)
+                    + (pb * pb.clamp_min(1e-8).log()).sum(1)).mean()
+                loss = pg - balance_coef * marg_entropy - ent_coef * samp_entropy
+                (loss / len(idx)).backward()
+
+                batch_reward += reward.mean().item()
+                batch_pg += pg.item()
+                batch_marg += marg_entropy.item()
+                n_img += 1
+
+            nn.utils.clip_grad_norm_(trainable, max_grad_norm)
+            optimizer.step()
+            reward_mean = batch_reward / max(n_img, 1)
+
+            if it % eval_every == 0:
+                acc, nmi, ari = self._eval_clustering_chain(
+                    encoder, swav_head, self.eval_images, self.eval_labels,
+                    instruction, max_new_tokens, show_progress=show_eval)
+                print(f"[GRPO-chain it={it:4d}] reward={reward_mean:.4f} "
+                      f"|pg|={batch_pg / max(n_img, 1):.4f} "
+                      f"H(marg)={batch_marg / max(n_img, 1):.3f} "
+                      f"ACC={acc:.4f} NMI={nmi:.4f} ARI={ari:.4f}")
+                self._log({"phase": "grpo_chain", "iter": it, "reward": reward_mean,
+                           "acc": acc, "nmi": nmi, "ari": ari,
+                           "marg_entropy": batch_marg / max(n_img, 1)})
+                if acc > best_acc:
+                    best_acc, no_improve = acc, 0
+                    self._save(encoder, swav_head, "rl_best")
+                    print(f"  -> GRPO-chain best ACC={best_acc:.4f}")
+                else:
+                    no_improve += 1
+                    if patience and no_improve >= patience:
+                        print(f"[GRPO-chain] early stop: {patience} pts w/o improvement, "
+                              f"best ACC={best_acc:.4f}")
+                        break
+
+        print(f"[GRPO-chain] Done. Best ACC={best_acc:.4f}")
+
     # ---- 编排 ---------------------------------------------------------------
 
     def train(self) -> None:
@@ -624,12 +785,23 @@ class Trainer:
                 self._load_checkpoint(encoder, swav_head, str(best_path))
                 print("[trainer] Reloaded warmup_best before RL.")
 
+        rl_mode = str(tcfg.get("rl_mode", "cluster")).lower()
         if tcfg.get("rl_iterations", 0) > 0:
-            print("\n=== Phase 2: REINFORCE / PPO ===")
-            self._train_reinforce(encoder, swav_head, images, INSTRUCTION)
+            if rl_mode == "chain":
+                print("\n=== Phase 2: GRPO-chain (DeepSeek 式生成链) ===")
+                self._train_reinforce_chain(encoder, swav_head, images, INSTRUCTION)
+            else:
+                print("\n=== Phase 2: REINFORCE / PPO (簇分配动作) ===")
+                self._train_reinforce(encoder, swav_head, images, INSTRUCTION)
 
-        acc, nmi, ari = eval_clustering(encoder, swav_head, self.eval_images, self.eval_labels,
-                                        INSTRUCTION, self.device, dcfg.get("encode_batch_size", 8))
+        if rl_mode == "chain" and tcfg.get("rl_iterations", 0) > 0:
+            acc, nmi, ari = self._eval_clustering_chain(
+                encoder, swav_head, self.eval_images, self.eval_labels,
+                INSTRUCTION, int(tcfg.get("max_new_tokens", 20)))
+        else:
+            acc, nmi, ari = eval_clustering(encoder, swav_head, self.eval_images,
+                                            self.eval_labels, INSTRUCTION, self.device,
+                                            dcfg.get("encode_batch_size", 8))
         print(f"\n[FINAL] ACC={acc:.4f} NMI={nmi:.4f} ARI={ari:.4f}")
         self._save(encoder, swav_head, "final")
 

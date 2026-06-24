@@ -115,6 +115,96 @@ class CriterionEncoder(nn.Module):
         """Return raw hidden states (N, hidden_dim)."""
         return torch.stack([self.encode_hidden_one(criterion, img) for img in images], dim=0)
 
+    # ---- DeepSeek 式：生成推理链 + 重新打分 -------------------------------
+
+    def _build_inputs(self, criterion: str, image: Image.Image) -> tuple[dict, int]:
+        """构造单图输入（含 add_generation_prompt），返回 (inputs, 提示词长度 L)。"""
+        messages = self._build_message(criterion, image)
+        text_prompt = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        inputs = self.processor(text=[text_prompt], images=[image], return_tensors="pt")
+        inputs = {k: v.to(self._device) if isinstance(v, torch.Tensor) else v
+                  for k, v in inputs.items()}
+        return inputs, int(inputs["input_ids"].shape[1])
+
+    @torch.no_grad()
+    def generate_chains(
+        self,
+        criterion: str,
+        image: Image.Image,
+        n_samples: int,
+        max_new_tokens: int = 20,
+        temperature: float = 1.0,
+        do_sample: bool = True,
+    ) -> tuple[dict, int, list[torch.Tensor]]:
+        """Rollout：对一张图生成推理链（no_grad）。
+
+        do_sample=True 时采样 n_samples 条不同的链（训练 rollout）；
+        do_sample=False 时贪心生成 1 条（评估用，n_samples 被忽略）。
+
+        返回 (inputs, L, gen_ids_list)：
+          inputs       —— 提示词输入（含 pixel_values），score_chains 复用
+          L            —— 提示词 token 数
+          gen_ids_list —— 每条链新生成的 token id（1D LongTensor，不含提示词）
+        """
+        inputs, L = self._build_inputs(criterion, image)
+        gen_kwargs = dict(max_new_tokens=max_new_tokens, return_dict_in_generate=True)
+        if do_sample:
+            gen_kwargs.update(do_sample=True, temperature=temperature,
+                              num_return_sequences=n_samples)
+        else:
+            gen_kwargs.update(do_sample=False)
+        gen = self.backbone.generate(**inputs, **gen_kwargs)
+        seqs = gen.sequences                       # (n, L+T)
+        gen_ids = [seqs[i, L:].detach() for i in range(seqs.shape[0])]
+        return inputs, L, gen_ids
+
+    def score_chains(
+        self,
+        inputs: dict,
+        L: int,
+        gen_ids: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """带梯度重新 forward「提示词+链」，返回 (sum_logp, final_hidden)。
+
+          sum_logp     —— (G,) 每条链生成 token 的 log p 之和（可导，训 LoRA）
+          final_hidden —— (G, hidden) 每条链末态最后一层隐状态（可导，给聚类用）
+
+        因果 mask 保证位置 i 的 logits 只依赖前缀，故一次整段 forward 即可还原
+        每个生成位置当时的条件概率（teacher forcing）。
+        """
+        base_ids = inputs["input_ids"][0]          # (L,)
+        base_mmtype = inputs.get("mm_token_type_ids")
+        # input_ids / attention_mask / mm_token_type_ids 随序列变长，需重建；
+        # 其余（pixel_values / image_grid_thw）是图像侧、与序列长度无关，原样透传
+        extra = {k: v for k, v in inputs.items()
+                 if k not in ("input_ids", "attention_mask", "mm_token_type_ids")}
+        logps, hiddens = [], []
+        for g in gen_ids:
+            T = int(g.shape[0])
+            full_ids = torch.cat([base_ids, g], dim=0).unsqueeze(0)   # (1, L+T)
+            attn = torch.ones_like(full_ids)
+            kw = dict(extra)
+            if base_mmtype is not None:
+                # 生成 token 全是文本（type 0），在末尾补 T 个 0
+                pad = torch.zeros((1, T), dtype=base_mmtype.dtype, device=base_mmtype.device)
+                kw["mm_token_type_ids"] = torch.cat([base_mmtype, pad], dim=1)
+            out = self.backbone(
+                input_ids=full_ids,
+                attention_mask=attn,
+                **kw,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            # 位置 L-1 .. L+T-2 的 logits 预测生成 token g[0..T-1]
+            pred_logits = out.logits[0, L - 1:L - 1 + T, :]
+            logp = F.log_softmax(pred_logits.float(), dim=-1)
+            token_logp = logp.gather(1, g.view(-1, 1)).squeeze(1)     # (T,)
+            logps.append(token_logp.sum())
+            hiddens.append(out.hidden_states[-1][0, -1, :].float())
+        return torch.stack(logps), torch.stack(hiddens)
+
     def forward(self, criterion: str, images: list[Image.Image]) -> torch.Tensor:
         return self.encode_batch(criterion, images)
 
